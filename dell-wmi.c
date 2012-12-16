@@ -47,6 +47,12 @@ static int acpi_video;
 
 MODULE_ALIAS("wmi:"DELL_EVENT_GUID);
 
+
+static int keymap_override_array[512];
+static int keymap_ovr_count;
+module_param_array(keymap_override_array, int, &keymap_ovr_count, 0000);
+MODULE_PARM_DESC(keymap_override_array, "An array of Bios keycode, Keycode pairs ex. '0xE024,148");
+
 /*
  * Certain keys are flagged as KE_IGNORE. All of these are either
  * notifications (rather than requests for change) or are also sent
@@ -193,6 +199,63 @@ static void dell_wmi_notify(u32 value, void *context)
 	kfree(obj);
 }
 
+static struct key_entry * __init dell_wmi_keymap_override_arrays(const struct key_entry *keymap_in)
+{
+	int x;
+	int num_key_entries = 0;
+	int num_overrides = keymap_ovr_count/2;
+	int new_keymap_size;
+	struct key_entry *keymap_out;
+	if(!keymap_in)
+		return NULL;
+	
+	if(keymap_ovr_count % 2 != 0)
+		pr_info("Invalid number of BIOS keycode->keycode array elements. Must be set in pairs. Only the first %d overrides will be processed\n", num_overrides);
+	
+	// Count number of current entries in the keymap
+	for(num_key_entries=0;;num_key_entries++)
+	{
+		if(keymap_in[num_key_entries].type == KE_END)
+		{
+			break;
+		}
+	}
+	new_keymap_size = num_key_entries + num_overrides;
+
+	keymap_out = kcalloc(new_keymap_size, sizeof(struct key_entry), GFP_KERNEL);
+	if (!keymap_out)
+		return NULL;
+
+	memcpy(keymap_out, keymap_in,sizeof(struct key_entry)*num_key_entries);
+
+	for(x=0;(x+1)<keymap_ovr_count;x+=2)
+	{
+		short exists = 0;
+		int y;
+		for(y=0;y<num_key_entries;y++)
+		{
+			if(keymap_out[y].code == keymap_override_array[x])
+			{
+				exists = 1;
+				keymap_out[y].keycode = keymap_override_array[x+1];
+			}
+		}
+		if(!exists)
+		{
+			keymap_out[num_key_entries].type = KE_KEY;
+			keymap_out[num_key_entries].code = keymap_override_array[x];
+			keymap_out[num_key_entries].keycode = keymap_override_array[x+1];
+			num_key_entries++;
+			
+		}
+		
+	}
+
+	keymap_out[num_key_entries].type = KE_END;
+
+	return keymap_out;
+}
+
 static const struct key_entry * __init dell_wmi_prepare_new_keymap(void)
 {
 	int hotkey_num = (dell_bios_hotkey_table->header.length - 4) /
@@ -222,6 +285,7 @@ static const struct key_entry * __init dell_wmi_prepare_new_keymap(void)
 static int __init dell_wmi_input_setup(void)
 {
 	int err;
+	const struct key_entry *keymap;
 
 	dell_wmi_input_dev = input_allocate_device();
 	if (!dell_wmi_input_dev)
@@ -232,23 +296,25 @@ static int __init dell_wmi_input_setup(void)
 	dell_wmi_input_dev->id.bustype = BUS_HOST;
 
 	if (dell_new_hk_type) {
-		const struct key_entry *keymap = dell_wmi_prepare_new_keymap();
-		if (!keymap) {
-			err = -ENOMEM;
-			goto err_free_dev;
-		}
-
-		err = sparse_keymap_setup(dell_wmi_input_dev, keymap, NULL);
-
-		/*
-		 * Sparse keymap library makes a copy of keymap so we
-		 * don't need the original one that was allocated.
-		 */
-		kfree(keymap);
+		const struct key_entry *hk_keymap = dell_wmi_prepare_new_keymap();
+		keymap = dell_wmi_keymap_override_arrays(hk_keymap);
+		kfree(hk_keymap);
 	} else {
-		err = sparse_keymap_setup(dell_wmi_input_dev,
-					  dell_wmi_legacy_keymap, NULL);
+		keymap = dell_wmi_keymap_override_arrays(dell_wmi_legacy_keymap);
 	}
+	
+	if (!keymap) {
+		err = -ENOMEM;
+		goto err_free_dev;
+	}
+
+	err = sparse_keymap_setup(dell_wmi_input_dev, keymap, NULL);
+	/*
+	 * Sparse keymap library makes a copy of keymap so we
+	 * don't need the original one that was allocated.
+	 */
+	kfree(keymap);
+	
 	if (err)
 		goto err_free_dev;
 
